@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,8 +24,8 @@ type (
 )
 
 type pinState struct {
-	pinNum uint8
-	state  rpio.State
+	pin   rpio.Pin
+	state rpio.State
 }
 
 // String is required to fulfill the flag.Value interface
@@ -118,14 +119,14 @@ func update(pin rpio.Pin, status map[rpio.Pin]rpio.State) bool {
 
 // monitor loops forever checking state of the pins, writes
 // state changes to the 'out' channel.
-func monitor(pin map[rpio.Pin]uint8, out chan pinState) {
+func monitor(pins []rpio.Pin, out chan pinState) {
 	status := make(map[rpio.Pin]rpio.State)
 	for {
-		for pin, pinNum := range pin {
+		for _, pin := range pins {
 			if update(pin, status) {
 				out <- pinState{
-					pinNum: pinNum,
-					state:  status[pin],
+					pin:   pin,
+					state: status[pin],
 				}
 			}
 		}
@@ -147,9 +148,10 @@ func main() {
 	}
 	defer rpio.Close()
 
-	var clients []net.Conn
+	clients := make(map[string]net.Conn)
+	var clientLock sync.Mutex
 	if tcpPort > 0 {
-		l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: tcpPort} )
+		l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: tcpPort})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -161,30 +163,36 @@ func main() {
 				if err != nil {
 					logErr.Println(err)
 				}
-				clients = append(clients, c)
+				clientLock.Lock()
+				clients[c.LocalAddr().String() + " - " + c.RemoteAddr().String()] = c
+				clientLock.Unlock()
 			}
 		}()
 	}
 
-	pin := make(map[rpio.Pin]uint8)
+	//pin := make(map[rpio.Pin]uint8)
+	var pins []rpio.Pin
 	for i, _ := range pinDescription {
 		p := rpio.Pin(i)
 		p.Input()
 		p.PullUp()
-		pin[p] = i
+		pins = append(pins, p)
 	}
 
 	changes := make(chan pinState)
-	go monitor(pin, changes)
+	go monitor(pins, changes)
 
 	for {
 		change := <-changes
-		msg := fmt.Sprintf("%s changed state to %s\n", pinDescription[change.pinNum], pinStateName[change.state])
-		for _, c := range clients {
-			_, err := c.Write([]byte(msg))
+		msg := fmt.Sprintf("%s changed state to %s\n", pinDescription[uint8(change.pin)], pinStateName[change.state])
+		clientLock.Lock()
+		for k, v := range clients {
+			_, err := v.Write([]byte(msg))
 			if err != nil {
 				logErr.Print(err)
+				delete(clients, k)
 			}
 		}
+		clientLock.Unlock()
 	}
 }
