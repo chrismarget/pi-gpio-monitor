@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"flag"
-	"github.com/getlantern/errors"
+	"fmt"
 	"github.com/stianeikeland/go-rpio"
 	"log"
 	"math"
+	"net"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -56,25 +59,26 @@ func splitArgString(in string) (uint8, string, error) {
 	}
 	i, err := strconv.Atoi(parts[0])
 	if i > math.MaxUint8 {
-		err = errors.New("values > %d not supported", math.MaxUint8)
+		err = fmt.Errorf("values > %d not supported", math.MaxUint8)
 	}
 	return uint8(i), parts[1], err
 }
 
 // ParseSCLI calls the flag library and parses the result. It returns maps
 // of pin descriptions (by pin number) and pin state names (by rpio.State)
-func parseCLI() (pinDescription, pinStateName, error) {
+func parseCLI() (pinDescription, pinStateName, int, error) {
 	var inPinName inPinNameArgs
 	var inPinState inPinStateArgs
 	flag.Var(&inPinName, "n", "Pin number : name, like this: '23:Thing attached to pin 23' ")
 	flag.Var(&inPinState, "s", "Pin state : description, like this: '1:Pin enabled' ")
+	tcpPort := flag.Int("l", -1, "tcp listen port")
 	flag.Parse()
 
 	pd := make(map[uint8]string)
 	for _, v := range inPinName {
 		pinNum, name, err := splitArgString(v)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, *tcpPort, err
 		}
 		pd[pinNum] = name
 	}
@@ -85,11 +89,11 @@ func parseCLI() (pinDescription, pinStateName, error) {
 	for _, v := range inPinState {
 		state, description, err := splitArgString(v)
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, *tcpPort, err
 		}
 		ps[rpio.State(state)] = description
 	}
-	return pd, ps, nil
+	return pd, ps, *tcpPort, nil
 }
 
 // update returns true if the pin status has changed.
@@ -130,7 +134,9 @@ func monitor(pin map[rpio.Pin]uint8, out chan pinState) {
 }
 
 func main() {
-	pinDescription, pinStateName, err := parseCLI()
+	logErr := log.New(os.Stderr, "", 0)
+
+	pinDescription, pinStateName, tcpPort, err := parseCLI()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -140,6 +146,25 @@ func main() {
 		log.Fatal(err)
 	}
 	defer rpio.Close()
+
+	var clients []net.Conn
+	if tcpPort > 0 {
+		l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: tcpPort} )
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer l.Close()
+
+		go func() {
+			for {
+				c, err := l.Accept()
+				if err != nil {
+					logErr.Println(err)
+				}
+				clients = append(clients, c)
+			}
+		}()
+	}
 
 	pin := make(map[rpio.Pin]uint8)
 	for i, _ := range pinDescription {
@@ -154,6 +179,12 @@ func main() {
 
 	for {
 		change := <-changes
-		log.Printf("%s changed state to %s\n", pinDescription[change.pinNum], pinStateName[change.state])
+		msg := fmt.Sprintf("%s changed state to %s\n", pinDescription[change.pinNum], pinStateName[change.state])
+		for _, c := range clients {
+			_, err := c.Write([]byte(msg))
+			if err != nil {
+				logErr.Print(err)
+			}
+		}
 	}
 }
