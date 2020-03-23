@@ -8,7 +8,6 @@ import (
 	"log"
 	"math"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -135,8 +134,6 @@ func monitor(pins []rpio.Pin, out chan pinState) {
 }
 
 func main() {
-	logErr := log.New(os.Stderr, "", 0)
-
 	pinDescription, pinStateName, tcpPort, err := parseCLI()
 	if err != nil {
 		log.Fatal(err)
@@ -161,7 +158,8 @@ func main() {
 			for {
 				c, err := l.Accept()
 				if err != nil {
-					logErr.Println(err)
+					log.Println(err)
+					continue
 				}
 				clientLock.Lock()
 				clients[c.LocalAddr().String() + " - " + c.RemoteAddr().String()] = c
@@ -189,7 +187,7 @@ func main() {
 		for k, v := range clients {
 			_, err := v.Write([]byte(msg))
 			if err != nil {
-				logErr.Print(err)
+				log.Println(err)
 				delete(clients, k)
 			}
 		}
