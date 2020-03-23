@@ -18,13 +18,20 @@ type (
 	inPinNameArgs  []string
 	inPinStateArgs []string
 	pinDescription map[uint8]string
-	pinStateName   map[rpio.State]string
-	pinName        map[rpio.Pin]string
+	pinStates      map[rpio.State]string
 )
 
 type pinState struct {
 	pin   rpio.Pin
 	state rpio.State
+}
+
+type config struct {
+	pinDescription pinDescription
+	pinStates      pinStates
+	port           int
+	interval       int
+	debug          bool
 }
 
 // String is required to fulfill the flag.Value interface
@@ -66,19 +73,21 @@ func splitArgString(in string) (uint8, string, error) {
 
 // ParseSCLI calls the flag library and parses the result. It returns maps
 // of pin descriptions (by pin number) and pin state names (by rpio.State)
-func parseCLI() (pinDescription, pinStateName, int, error) {
+func parseCLI() (config, error) {
 	var inPinName inPinNameArgs
 	var inPinState inPinStateArgs
 	flag.Var(&inPinName, "n", "Pin number : name, like this: '23:Thing attached to pin 23' ")
 	flag.Var(&inPinState, "s", "Pin state : description, like this: '1:Pin enabled' ")
 	tcpPort := flag.Int("l", -1, "tcp listen port")
+	interval := flag.Int("i", 100, "polling interval (ms) default: 100")
+	debug := flag.Bool("d", false, "debug to stdErr")
 	flag.Parse()
 
 	pd := make(map[uint8]string)
 	for _, v := range inPinName {
 		pinNum, name, err := splitArgString(v)
 		if err != nil {
-			return nil, nil, *tcpPort, err
+			return config{}, err
 		}
 		pd[pinNum] = name
 	}
@@ -89,11 +98,17 @@ func parseCLI() (pinDescription, pinStateName, int, error) {
 	for _, v := range inPinState {
 		state, description, err := splitArgString(v)
 		if err != nil {
-			return nil, nil, *tcpPort, err
+			return config{}, err
 		}
 		ps[rpio.State(state)] = description
 	}
-	return pd, ps, *tcpPort, nil
+	return config{
+		pinDescription: pd,
+		pinStates:      ps,
+		port:           *tcpPort,
+		interval:       *interval,
+		debug:          *debug,
+	}, nil
 }
 
 // update returns true if the pin status has changed.
@@ -118,7 +133,7 @@ func update(pin rpio.Pin, status map[rpio.Pin]rpio.State) bool {
 
 // monitor loops forever checking state of the pins, writes
 // state changes to the 'out' channel.
-func monitor(pins []rpio.Pin, out chan pinState) {
+func monitor(pins []rpio.Pin, out chan pinState, interval int) {
 	status := make(map[rpio.Pin]rpio.State)
 	for {
 		for _, pin := range pins {
@@ -134,7 +149,7 @@ func monitor(pins []rpio.Pin, out chan pinState) {
 }
 
 func main() {
-	pinDescription, pinStateName, tcpPort, err := parseCLI()
+	config, err := parseCLI()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -147,8 +162,8 @@ func main() {
 
 	clients := make(map[string]net.Conn)
 	var clientLock sync.Mutex
-	if tcpPort > 0 {
-		l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: tcpPort})
+	if config.port > 0 {
+		l, err := net.ListenTCP("tcp", &net.TCPAddr{Port: config.port})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -162,7 +177,7 @@ func main() {
 					continue
 				}
 				clientLock.Lock()
-				clients[c.LocalAddr().String() + " - " + c.RemoteAddr().String()] = c
+				clients[c.LocalAddr().String()+" - "+c.RemoteAddr().String()] = c
 				clientLock.Unlock()
 			}
 		}()
@@ -170,7 +185,7 @@ func main() {
 
 	//pin := make(map[rpio.Pin]uint8)
 	var pins []rpio.Pin
-	for i, _ := range pinDescription {
+	for i, _ := range config.pinDescription {
 		p := rpio.Pin(i)
 		p.Input()
 		p.PullUp()
@@ -178,16 +193,23 @@ func main() {
 	}
 
 	changes := make(chan pinState)
-	go monitor(pins, changes)
+	go monitor(pins, changes, 100)
 
 	for {
 		change := <-changes
-		msg := fmt.Sprintf("%s changed state to %s\n", pinDescription[uint8(change.pin)], pinStateName[change.state])
+		msg := fmt.Sprintf("%s changed state to %s\n",
+			config.pinDescription[uint8(change.pin)],
+			config.pinStates[change.state])
 		clientLock.Lock()
 		for k, v := range clients {
 			_, err := v.Write([]byte(msg))
 			if err != nil {
 				log.Println(err)
+				err = v.Close()
+				if err != nil {
+					log.Println(err)
+				}
+				clients[k] = nil
 				delete(clients, k)
 			}
 		}
